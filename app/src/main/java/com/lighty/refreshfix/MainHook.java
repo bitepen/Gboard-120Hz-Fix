@@ -4,6 +4,8 @@ import android.app.Dialog;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.MotionEvent;
+import android.view.Surface;
+import android.view.SurfaceControl;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
@@ -23,17 +25,24 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String TARGET_PACKAGE = "com.google.android.inputmethod.latin";
     private static final float BOOST_FPS = 120.0f;
     private static final float IDLE_FPS = 0.0f;
-    // 停手 2.5 秒后自动解除 120Hz 下限锁定，恢复 LTPO 动态降频
+    // 停手 2.5 秒后自动解除窗口 120Hz 下限锁定
     private static final long IDLE_TIMEOUT_MS = 2500L;
 
-    // 懒加载 Handler，避免在 LSPosed 实例化模块时崩溃
+    // FrameRateCategory 常量 (Android 14/15/16+)
+    private static final int CATEGORY_LOW = 2;        // 30Hz
+    private static final int CATEGORY_NORMAL = 3;     // 60Hz
+    private static final int CATEGORY_HIGH_HINT = 4;
+    private static final int CATEGORY_HIGH = 5;       // 120Hz
+
     private Handler mainHandler;
     private Window currentWindow;
+    private volatile boolean isTypingActive = false;
     private final Set<Class<?>> hookedDecorClasses = Collections.newSetFromMap(new WeakHashMap<>());
 
     private final Runnable idleReleaseTask = new Runnable() {
         @Override
         public void run() {
+            isTypingActive = false;
             setWindowMinRefreshRate(currentWindow, IDLE_FPS);
         }
     };
@@ -51,7 +60,13 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        // 1. 复刻四月份原版 Hook 点：showWindow 时立即开启 120Hz，并挂载根视图触摸监听
+        // 1. 拔除 Android 15/16+ 针对 TYPE_INPUT_METHOD 的打字 60Hz 强制降频开关
+        disableToolkitTypingFrameRateLimit(lpparam.classLoader);
+
+        // 2. 拦截 SurfaceControl 与 ViewRootImpl 的 60Hz (CATEGORY_NORMAL) 小面积重绘投票
+        hookFrameRateVotes(lpparam.classLoader);
+
+        // 3. 监听输入法窗口弹出：开启 120Hz 并绑定触摸监听
         XposedHelpers.findAndHookMethod(
                 "android.inputmethodservice.InputMethodService",
                 lpparam.classLoader,
@@ -71,7 +86,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
         );
 
-        // 2. 键盘隐藏时：立即取消倒计时并释放 120Hz 锁
+        // 4. 键盘隐藏时：立即取消倒计时并释放 120Hz 锁
         XposedHelpers.findAndHookMethod(
                 "android.inputmethodservice.InputMethodService",
                 lpparam.classLoader,
@@ -79,13 +94,14 @@ public class MainHook implements IXposedHookLoadPackage {
                 new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
+                        isTypingActive = false;
                         getMainHandler().removeCallbacks(idleReleaseTask);
                         setWindowMinRefreshRate(currentWindow, IDLE_FPS);
                     }
                 }
         );
 
-        // 3. 直接 Hook SoftInputWindow（而非被内联的父类 Dialog）拦截触摸事件
+        // 5. 拦截 SoftInputWindow 触摸事件
         try {
             XposedHelpers.findAndHookMethod(
                     "android.inputmethodservice.SoftInputWindow",
@@ -105,12 +121,108 @@ public class MainHook implements IXposedHookLoadPackage {
                         }
                     }
             );
-        } catch (Throwable t) {
-            XposedBridge.log("RefreshFix: SoftInputWindow hook fallback to DecorView: " + t.getMessage());
+        } catch (Throwable ignored) {
         }
     }
 
-    // 双保险：直接 Hook 键盘窗口 DecorView 的 dispatchTouchEvent，防内联且不漏任何点击
+    private void disableToolkitTypingFrameRateLimit(ClassLoader classLoader) {
+        try {
+            XposedHelpers.setStaticBooleanField(View.class, "sToolkitFrameRateTypingReadOnlyFlagValue", false);
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> vriClass = XposedHelpers.findClass("android.view.ViewRootImpl", classLoader);
+            XposedHelpers.setStaticBooleanField(vriClass, "sToolkitFrameRateTypingReadOnlyFlagValue", false);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void hookFrameRateVotes(ClassLoader classLoader) {
+        // 拦截 SurfaceControl.Transaction.setFrameRateCategory (消除 60Hz 横跳的核心)
+        try {
+            XposedBridge.hookAllMethods(
+                    SurfaceControl.Transaction.class,
+                    "setFrameRateCategory",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            // 签名: setFrameRateCategory(SurfaceControl sc, int category, boolean ...)
+                            if (isTypingActive && param.args.length >= 2 && param.args[1] instanceof Integer) {
+                                int category = (Integer) param.args[1];
+                                // 拦截 LOW(2, 30Hz)、NORMAL(3, 60Hz)、HIGH_HINT(4)，统一升为 HIGH(5, 120Hz)
+                                // 保留 DEFAULT(0) 和 NO_PREFERENCE(1)，确保停手瞬间依然能掉回 24Hz/1Hz 省电
+                                if (category >= CATEGORY_LOW && category < CATEGORY_HIGH) {
+                                    param.args[1] = CATEGORY_HIGH;
+                                }
+                            }
+                        }
+                    }
+            );
+        } catch (Throwable ignored) {
+        }
+
+        // 拦截 SurfaceControl.Transaction.setFrameRate
+        try {
+            XposedBridge.hookAllMethods(
+                    SurfaceControl.Transaction.class,
+                    "setFrameRate",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (isTypingActive && param.args.length >= 2 && param.args[1] instanceof Float) {
+                                float rate = (Float) param.args[1];
+                                if (rate > 0.0f && rate < BOOST_FPS) {
+                                    param.args[1] = BOOST_FPS;
+                                }
+                            }
+                        }
+                    }
+            );
+        } catch (Throwable ignored) {
+        }
+
+        // 拦截 ViewRootImpl 内部的 setPreferredFrameRateCategory 投票汇总
+        try {
+            Class<?> vriClass = XposedHelpers.findClass("android.view.ViewRootImpl", classLoader);
+            XposedBridge.hookAllMethods(
+                    vriClass,
+                    "setPreferredFrameRateCategory",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (isTypingActive && param.args.length >= 1 && param.args[0] instanceof Integer) {
+                                int category = (Integer) param.args[0];
+                                if (category >= CATEGORY_LOW && category < CATEGORY_HIGH) {
+                                    param.args[0] = CATEGORY_HIGH;
+                                }
+                            }
+                        }
+                    }
+            );
+        } catch (Throwable ignored) {
+        }
+
+        // 兜底拦截 Surface.setFrameRate
+        try {
+            XposedBridge.hookAllMethods(
+                    Surface.class,
+                    "setFrameRate",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (isTypingActive && param.args.length >= 1 && param.args[0] instanceof Float) {
+                                float rate = (Float) param.args[0];
+                                if (rate > 0.0f && rate < BOOST_FPS) {
+                                    param.args[0] = BOOST_FPS;
+                                }
+                            }
+                        }
+                    }
+            );
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void hookDecorViewIfNeeded(Window window) {
         if (window == null) return;
         View decor = window.peekDecorView();
@@ -143,15 +255,14 @@ public class MainHook implements IXposedHookLoadPackage {
         if (window == null || event == null) return;
         int action = event.getActionMasked();
         if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) {
-            // 手指按下或滑行输入：保持 120Hz，暂停空闲倒计时
             onUserInteraction(window, false);
         } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-            // 手指抬起：保持 120Hz，并重新开始 2.5 秒空闲倒计时
             onUserInteraction(window, true);
         }
     }
 
     private void onUserInteraction(Window window, boolean scheduleIdleTimeout) {
+        isTypingActive = true;
         Handler handler = getMainHandler();
         handler.removeCallbacks(idleReleaseTask);
         setWindowMinRefreshRate(window, BOOST_FPS);
@@ -169,7 +280,6 @@ public class MainHook implements IXposedHookLoadPackage {
             try {
                 float currentMin = XposedHelpers.getFloatField(params, "preferredMinDisplayRefreshRate");
                 float currentMax = XposedHelpers.getFloatField(params, "preferredMaxDisplayRefreshRate");
-                // 只有当实际属性值需要改变时才调用 setAttributes，连续打字期间 0 额外开销
                 if (Math.abs(currentMin - minRate) < 0.1f && Math.abs(currentMax - BOOST_FPS) < 0.1f) {
                     return;
                 }
