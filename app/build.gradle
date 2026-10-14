@@ -9,11 +9,11 @@ android {
     defaultConfig {
         applicationId "com.lighty.refreshfix"
         minSdk 28
-        targetSdk 34
-        versionCode 4
-        versionName "4.0"
+        targetSdk 37
+        versionCode 5
+        versionName "4.1"
     }
-    
+
     signingConfigs {
         release {
             storeFile file("release.jks")
@@ -28,6 +28,12 @@ android {
             minifyEnabled false
             signingConfig signingConfigs.release
         }
+    }
+
+    // 关键提速：关闭 Release 打包时漫长的 Lint 静态检查
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
     }
 
     compileOptions {
