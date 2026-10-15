@@ -5,11 +5,14 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.view.Display;
 import android.view.MotionEvent;
+import android.view.WindowManager;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.List;
+import java.lang.reflect.Modifier;
+import java.util.Collections;
+import java.util.Set;
+import java.util.WeakHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -26,28 +29,19 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final long IDLE_TIMEOUT_MS = 600L;
     private static final long MOVE_THROTTLE_MS = 200L;
 
+    // 弱引用保存所有 TYPE_INPUT_METHOD 类型的 WindowState，自动随窗口销毁回收
+    private final Set<Object> mImeWindows = Collections.newSetFromMap(new WeakHashMap<>());
+
     // DisplayModeDirector 核心引用
     private volatile Object mDisplayModeDirector;
     private volatile Object mDirectorLock;
     private volatile Handler mDirectorHandler;
     private Method mNotifySpecsChangedMethod;
 
-    // DisplayContent 与输入法窗口缓存
-    private volatile Object mCachedDisplayContent;
-    private Field mImeWindowField;
-
-    // DesiredDisplayModeSpecs 反射字段缓存
-    private final List<Field> mRangesFields = new ArrayList<>();
-    private Field mIdleConfigField;
-    private Field mPhysicalRangeField;
-    private Field mRenderRangeField;
-    private Field mMinRateField;
-    private Field mMaxRateField;
-    private boolean mSpecsFieldsResolved = false;
-
     // 运行状态与一次性诊断日志标志
     private volatile boolean mIsImeBoostActive = false;
     private volatile long mLastMoveTime = 0L;
+    private boolean mFirstWindowCapturedLogged = false;
     private boolean mFirstTouchLogged = false;
     private boolean mFirstSpecsLogged = false;
     private boolean mImeVisibilityErrorLogged = false;
@@ -69,6 +63,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         try {
+            hookWindowState(lpparam.classLoader);
             hookPointerListener(lpparam.classLoader);
             hookDisplayModeDirector(lpparam.classLoader);
             XposedBridge.log(TAG + "System framework hooks installed successfully.");
@@ -78,7 +73,49 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 1. 监听全局触摸事件：检查输入法窗口是否可见
+     * 1. 直接在 WindowState 构造时通过公开的 LayoutParams.type == TYPE_INPUT_METHOD 捕获输入法窗口
+     */
+    private void hookWindowState(ClassLoader classLoader) {
+        Class<?> windowStateClass = XposedHelpers.findClass(
+                "com.android.server.wm.WindowState", classLoader);
+
+        XposedBridge.hookAllConstructors(windowStateClass, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                try {
+                    WindowManager.LayoutParams lp = null;
+                    if (param.args != null) {
+                        for (Object arg : param.args) {
+                            if (arg instanceof WindowManager.LayoutParams) {
+                                lp = (WindowManager.LayoutParams) arg;
+                                break;
+                            }
+                        }
+                    }
+                    if (lp == null) {
+                        Object attrs = XposedHelpers.getObjectField(param.thisObject, "mAttrs");
+                        if (attrs instanceof WindowManager.LayoutParams) {
+                            lp = (WindowManager.LayoutParams) attrs;
+                        }
+                    }
+
+                    if (lp != null && lp.type == WindowManager.LayoutParams.TYPE_INPUT_METHOD) {
+                        synchronized (mImeWindows) {
+                            mImeWindows.add(param.thisObject);
+                        }
+                        if (!mFirstWindowCapturedLogged) {
+                            mFirstWindowCapturedLogged = true;
+                            XposedBridge.log(TAG + "Captured IME WindowState (" + lp.packageName + ").");
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
+    /**
+     * 2. 监听全局触摸事件：当输入法 WindowState 处于可见状态时激活 120Hz
      */
     private void hookPointerListener(ClassLoader classLoader) {
         XposedHelpers.findAndHookMethod(
@@ -107,7 +144,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 return;
                             }
 
-                            if (isImeWindowVisible(param.thisObject)) {
+                            if (isImeWindowVisible()) {
                                 onImeInteraction();
                             }
                         } catch (Throwable ignored) {
@@ -118,7 +155,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 2. 拦截 DisplayModeDirector.getDesiredDisplayModeSpecs
+     * 3. 拦截 DisplayModeDirector.getDesiredDisplayModeSpecs
      */
     private void hookDisplayModeDirector(ClassLoader classLoader) {
         Class<?> directorClass = XposedHelpers.findClassIfExists(
@@ -183,22 +220,18 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private boolean isImeWindowVisible(Object pointerListener) {
+    private boolean isImeWindowVisible() {
         try {
-            Object displayContent = mCachedDisplayContent;
-            if (displayContent == null) {
-                displayContent = resolveDisplayContent(pointerListener);
-                if (displayContent == null) return false;
+            synchronized (mImeWindows) {
+                for (Object win : mImeWindows) {
+                    if (win == null) continue;
+                    Boolean visible = (Boolean) XposedHelpers.callMethod(win, "isVisible");
+                    if (visible != null && visible) {
+                        return true;
+                    }
+                }
             }
-
-            if (mImeWindowField == null) {
-                mImeWindowField = XposedHelpers.findField(displayContent.getClass(), "mInputMethodWindow");
-            }
-
-            Object imeWindow = mImeWindowField.get(displayContent);
-            if (imeWindow == null) return false;
-
-            return (Boolean) XposedHelpers.callMethod(imeWindow, "isVisible");
+            return false;
         } catch (Throwable t) {
             if (!mImeVisibilityErrorLogged) {
                 mImeVisibilityErrorLogged = true;
@@ -206,43 +239,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             return false;
         }
-    }
-
-    /**
-     * 兼容内部类 DisplayPolicy$1：通过 this$0 获取外部类 DisplayPolicy，再读取 mDisplayContent
-     */
-    private Object resolveDisplayContent(Object pointerListener) throws Exception {
-        Object callbacks = XposedHelpers.getObjectField(pointerListener, "mCallbacks");
-        if (callbacks == null) return null;
-
-        Object displayPolicy = null;
-        Field directDcField = XposedHelpers.findFieldIfExists(callbacks.getClass(), "mDisplayContent");
-        if (directDcField != null) {
-            displayPolicy = callbacks;
-        } else {
-            // 匿名内部类 DisplayPolicy$1 通过合成字段 this$0 持有外部类 DisplayPolicy
-            Field outerField = XposedHelpers.findFieldIfExists(callbacks.getClass(), "this$0");
-            if (outerField != null) {
-                displayPolicy = outerField.get(callbacks);
-            } else {
-                for (Field f : callbacks.getClass().getDeclaredFields()) {
-                    if (f.getType().getName().endsWith("DisplayPolicy")) {
-                        f.setAccessible(true);
-                        displayPolicy = f.get(callbacks);
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (displayPolicy == null) return null;
-
-        Object dc = XposedHelpers.getObjectField(displayPolicy, "mDisplayContent");
-        if (dc != null) {
-            mCachedDisplayContent = dc;
-            XposedBridge.log(TAG + "DisplayContent resolved successfully.");
-        }
-        return dc;
     }
 
     private void onImeInteraction() {
@@ -277,55 +273,56 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * 递归遍历 DesiredDisplayModeSpecs 内部的所有 RefreshRateRange 结构并将 min/max 设为 120.0f
+     */
     private void applyBoostToSpecs(Object specs) throws Exception {
-        if (!mSpecsFieldsResolved) {
-            Class<?> specsClass = specs.getClass();
-            for (Field f : specsClass.getDeclaredFields()) {
-                f.setAccessible(true);
-                String typeName = f.getType().getSimpleName();
-                if ("RefreshRateRanges".equals(typeName)) {
-                    mRangesFields.add(f);
-                    Object rangesObj = f.get(specs);
-                    if (rangesObj != null && mPhysicalRangeField == null) {
-                        mPhysicalRangeField = XposedHelpers.findFieldIfExists(rangesObj.getClass(), "physical");
-                        mRenderRangeField = XposedHelpers.findFieldIfExists(rangesObj.getClass(), "render");
-                        if (mPhysicalRangeField != null) {
-                            Object rangeObj = mPhysicalRangeField.get(rangesObj);
-                            if (rangeObj != null) {
-                                mMinRateField = XposedHelpers.findFieldIfExists(rangeObj.getClass(), "min");
-                                mMaxRateField = XposedHelpers.findFieldIfExists(rangeObj.getClass(), "max");
-                            }
-                        }
+        String beforeStr = !mFirstSpecsLogged ? specs.toString() : null;
+
+        for (Field f : specs.getClass().getDeclaredFields()) {
+            if (Modifier.isStatic(f.getModifiers())) continue;
+            f.setAccessible(true);
+            Object val = f.get(specs);
+            if (val == null) continue;
+
+            if (f.getName().contains("idle") || f.getType().getSimpleName().contains("Idle")) {
+                f.set(specs, null);
+                continue;
+            }
+
+            if (!lockRangeObject(val)) {
+                for (Field subField : val.getClass().getDeclaredFields()) {
+                    if (Modifier.isStatic(subField.getModifiers())) continue;
+                    subField.setAccessible(true);
+                    Object subVal = subField.get(val);
+                    if (subVal != null) {
+                        lockRangeObject(subVal);
                     }
-                } else if ("idleScreenRefreshRateConfig".equals(f.getName())) {
-                    mIdleConfigField = f;
                 }
             }
-            mSpecsFieldsResolved = true;
-        }
-
-        for (Field rangesField : mRangesFields) {
-            Object rangesObj = rangesField.get(specs);
-            if (rangesObj != null && mPhysicalRangeField != null && mRenderRangeField != null) {
-                lockSingleRange(mPhysicalRangeField.get(rangesObj));
-                lockSingleRange(mRenderRangeField.get(rangesObj));
-            }
-        }
-
-        if (mIdleConfigField != null) {
-            mIdleConfigField.set(specs, null);
         }
 
         if (!mFirstSpecsLogged) {
             mFirstSpecsLogged = true;
-            XposedBridge.log(TAG + "Boosted DesiredDisplayModeSpecs: " + specs.toString());
+            XposedBridge.log(TAG + "Boosted Specs: before=[" + beforeStr + "] -> after=[" + specs.toString() + "]");
         }
     }
 
-    private void lockSingleRange(Object rangeObj) throws Exception {
-        if (rangeObj == null || mMinRateField == null || mMaxRateField == null) return;
-        mMinRateField.setFloat(rangeObj, TARGET_FPS);
-        mMaxRateField.setFloat(rangeObj, TARGET_FPS);
+    private boolean lockRangeObject(Object obj) {
+        try {
+            Field minField = XposedHelpers.findFieldIfExists(obj.getClass(), "min");
+            Field maxField = XposedHelpers.findFieldIfExists(obj.getClass(), "max");
+            if (minField != null && maxField != null
+                    && minField.getType() == float.class && maxField.getType() == float.class) {
+                minField.setAccessible(true);
+                maxField.setAccessible(true);
+                minField.setFloat(obj, TARGET_FPS);
+                maxField.setFloat(obj, TARGET_FPS);
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
     }
 
     private Handler getWorkHandler() {
