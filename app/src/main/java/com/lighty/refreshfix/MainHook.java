@@ -1,16 +1,13 @@
 package com.lighty.refreshfix;
 
-import android.app.Dialog;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
-import android.view.InputEvent;
+import android.view.Display;
 import android.view.MotionEvent;
-import android.view.Surface;
-import android.view.SurfaceControl;
-import android.view.View;
-import android.view.Window;
-import android.view.WindowManager;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -20,296 +17,287 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class MainHook implements IXposedHookLoadPackage {
 
-    private static final String TARGET_PACKAGE = "com.google.android.inputmethod.latin";
-    private static final float BOOST_FPS = 120.0f;
-    private static final float IDLE_FPS = 0.0f;
-    // 停手 2.5 秒后解除窗口 120Hz 下限锁，交还给 LTPO 降频至 24Hz/1Hz
-    private static final long IDLE_TIMEOUT_MS = 2500L;
-    // 触摸/打字事件节流间隔（避免高频移动时反复操作 Handler）
-    private static final long INTERACTION_THROTTLE_MS = 250L;
+    private static final String TAG = "[RefreshFix] ";
+    private static final String SYSTEM_FRAMEWORK = "android";
 
-    private static final int CATEGORY_LOW = 2;        // 30Hz
-    private static final int CATEGORY_NORMAL = 3;     // 60Hz
-    private static final int CATEGORY_HIGH_HINT = 4;
-    private static final int CATEGORY_HIGH = 5;       // 120Hz
+    private static final float TARGET_FPS = 120.0f;
+    // 停手 600ms 后自动释放 120Hz 下限锁，恢复 LTPO 动态降频
+    private static final long IDLE_TIMEOUT_MS = 600L;
+    // MOVE 事件节流间隔，避免滑动输入时高频操作 Handler
+    private static final long MOVE_THROTTLE_MS = 200L;
 
-    private Handler mainHandler;
-    private Object currentIms;
-    private Window currentWindow;
-    private volatile boolean isLocked120 = false;
-    private volatile long lastScheduleTime = 0L;
+    // 系统服务单例引用
+    private volatile Object mDefaultDisplayContent;
+    private volatile Object mDisplayModeDirector;
+    private volatile Handler mDirectorHandler;
 
-    private final Runnable idleReleaseTask = new Runnable() {
+    // 反射缓存（仅首次解析一次，运行时零查找开销）
+    private Field mImeWindowField;
+    private Method mIsVisibleMethod;
+    private Method mNotifySpecsChangedMethod;
+
+    private Field mPrimaryRangesField;
+    private Field mAppRequestRangesField;
+    private Field mIdleConfigField;
+    private Field mPhysicalRangeField;
+    private Field mRenderRangeField;
+    private Field mMinRateField;
+    private Field mMaxRateField;
+    private boolean mSpecsFieldsResolved = false;
+
+    // 运行状态控制
+    private volatile boolean mIsImeBoostActive = false;
+    private volatile long mLastMoveTime = 0L;
+    private boolean mFirstBoostLogged = false;
+
+    private final Runnable mReleaseBoostTask = new Runnable() {
         @Override
         public void run() {
-            isLocked120 = false;
-            setWindowMinRefreshRate(getActiveWindow(), IDLE_FPS);
+            if (mIsImeBoostActive) {
+                mIsImeBoostActive = false;
+                triggerSpecsUpdate();
+            }
         }
     };
 
-    private Handler getMainHandler() {
-        if (mainHandler == null) {
-            mainHandler = new Handler(Looper.getMainLooper());
-        }
-        return mainHandler;
-    }
-
-    private Window getActiveWindow() {
-        if (currentWindow != null) {
-            return currentWindow;
-        }
-        if (currentIms != null) {
-            try {
-                Dialog dialog = (Dialog) XposedHelpers.callMethod(currentIms, "getWindow");
-                if (dialog != null) {
-                    currentWindow = dialog.getWindow();
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        return currentWindow;
-    }
-
     @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        if (!TARGET_PACKAGE.equals(lpparam.packageName)) {
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+        if (!SYSTEM_FRAMEWORK.equals(lpparam.packageName)) {
             return;
         }
 
-        // 1. 关闭 Android 15/16+ 针对输入法的打字限帧标志
-        disableToolkitTypingFrameRateLimit(lpparam.classLoader);
+        try {
+            hookDisplayPolicy(lpparam.classLoader);
+            hookPointerListener(lpparam.classLoader);
+            hookDisplayModeDirector(lpparam.classLoader);
+            XposedBridge.log(TAG + "System framework hooks installed successfully.");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "Initialization failed: " + t.getMessage());
+        }
+    }
 
-        // 2. 全程拦截 Gboard 渲染时的 60Hz 投票（不设状态门控，仅放行 0/1 空闲投票）
-        hookFrameRateVotes(lpparam.classLoader);
+    /**
+     * 1. 捕获默认主屏幕的 DisplayContent 引用，用于后续快速检查 mInputMethodWindow.isVisible()
+     */
+    private void hookDisplayPolicy(ClassLoader classLoader) {
+        Class<?> displayPolicyClass = XposedHelpers.findClass(
+                "com.android.server.wm.DisplayPolicy", classLoader);
 
-        // 3. 监听窗口弹出（复刻四月份验证有效的窗口属性修改点）
-        XposedHelpers.findAndHookMethod(
-                "android.inputmethodservice.InputMethodService",
-                lpparam.classLoader,
-                "showWindow",
-                boolean.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        currentIms = param.thisObject;
-                        Dialog dialog = (Dialog) XposedHelpers.callMethod(currentIms, "getWindow");
-                        if (dialog != null && dialog.getWindow() != null) {
-                            currentWindow = dialog.getWindow();
-                            boostAndResetTimer(true);
+        XposedBridge.hookAllConstructors(displayPolicyClass, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                try {
+                    Object displayContent = XposedHelpers.getObjectField(param.thisObject, "mDisplayContent");
+                    if (displayContent != null) {
+                        boolean isDefault = XposedHelpers.getBooleanField(displayContent, "isDefaultDisplay");
+                        if (isDefault) {
+                            mDefaultDisplayContent = displayContent;
+                            mImeWindowField = XposedHelpers.findField(displayContent.getClass(), "mInputMethodWindow");
                         }
                     }
+                } catch (Throwable ignored) {
                 }
-        );
+            }
+        });
+    }
 
-        // 4. 监听窗口隐藏：立即释放 120Hz 锁
+    /**
+     * 2. 监听全局触摸事件：仅在输入法窗口可见时触发/续期 120Hz 锁定
+     */
+    private void hookPointerListener(ClassLoader classLoader) {
         XposedHelpers.findAndHookMethod(
-                "android.inputmethodservice.InputMethodService",
-                lpparam.classLoader,
-                "hideWindow",
+                "com.android.server.wm.SystemGesturesPointerEventListener",
+                classLoader,
+                "onPointerEvent",
+                MotionEvent.class,
                 new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
-                        isLocked120 = false;
-                        getMainHandler().removeCallbacks(idleReleaseTask);
-                        setWindowMinRefreshRate(getActiveWindow(), IDLE_FPS);
+                        try {
+                            MotionEvent event = (MotionEvent) param.args[0];
+                            if (event == null) return;
+
+                            int action = event.getActionMasked();
+                            if (action == MotionEvent.ACTION_MOVE) {
+                                long now = SystemClock.uptimeMillis();
+                                if (now - mLastMoveTime < MOVE_THROTTLE_MS) {
+                                    return;
+                                }
+                                mLastMoveTime = now;
+                            } else if (action != MotionEvent.ACTION_DOWN
+                                    && action != MotionEvent.ACTION_UP
+                                    && action != MotionEvent.ACTION_POINTER_DOWN
+                                    && action != MotionEvent.ACTION_POINTER_UP) {
+                                return;
+                            }
+
+                            if (isImeWindowVisible()) {
+                                onImeInteraction();
+                            }
+                        } catch (Throwable ignored) {
+                        }
                     }
                 }
         );
+    }
 
-        // 5. 核心触摸入口 A：Hook JNI 回调入口 InputEventReceiver.dispatchInputEvent（C++ 直接调用，绝不会被内联）
-        try {
-            Class<?> ierClass = XposedHelpers.findClass("android.view.InputEventReceiver", lpparam.classLoader);
-            XposedBridge.hookAllMethods(
-                    ierClass,
-                    "dispatchInputEvent",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            if (param.args.length >= 2 && param.args[1] instanceof MotionEvent) {
-                                MotionEvent event = (MotionEvent) param.args[1];
-                                int action = event.getActionMasked();
-                                boolean forceReset = (action == MotionEvent.ACTION_DOWN
-                                        || action == MotionEvent.ACTION_UP
-                                        || action == MotionEvent.ACTION_POINTER_DOWN
-                                        || action == MotionEvent.ACTION_POINTER_UP);
-                                boostAndResetTimer(forceReset);
-                            } else if (param.args.length >= 1 && param.args[0] instanceof InputEvent) {
-                                boostAndResetTimer(false);
+    /**
+     * 3. 拦截 DisplayModeDirector：在打字活跃期内将主屏刷新率范围锁定为 [120Hz, 120Hz]
+     */
+    private void hookDisplayModeDirector(ClassLoader classLoader) {
+        Class<?> directorClass = XposedHelpers.findClassIfExists(
+                "com.android.server.display.mode.DisplayModeDirector", classLoader);
+        if (directorClass == null) {
+            directorClass = XposedHelpers.findClass(
+                    "com.android.server.display.DisplayModeDirector", classLoader);
+        }
+
+        XposedHelpers.findAndHookMethod(
+                directorClass,
+                "getDesiredDisplayModeSpecs",
+                int.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            if (mDisplayModeDirector == null) {
+                                initDirectorReferences(param.thisObject);
                             }
+
+                            int displayId = (Integer) param.args[0];
+                            if (!mIsImeBoostActive || displayId != Display.DEFAULT_DISPLAY) {
+                                return;
+                            }
+
+                            Object specs = param.getResult();
+                            if (specs != null) {
+                                applyBoostToSpecs(specs);
+                            }
+                        } catch (Throwable ignored) {
                         }
                     }
-            );
+                }
+        );
+    }
+
+    private void initDirectorReferences(Object director) {
+        try {
+            mDisplayModeDirector = director;
+            mDirectorHandler = (Handler) XposedHelpers.getObjectField(director, "mHandler");
+            mNotifySpecsChangedMethod = XposedHelpers.findMethodExact(
+                    director.getClass(), "notifyDesiredDisplayModeSpecsChanged");
         } catch (Throwable t) {
-            XposedBridge.log("RefreshFix: InputEventReceiver hook error: " + t.getMessage());
-        }
-
-        // 6. 核心触摸入口 B：直接 Hook 父类 Dialog.class 的 dispatchTouchEvent
-        try {
-            XposedHelpers.findAndHookMethod(
-                    Dialog.class,
-                    "dispatchTouchEvent",
-                    MotionEvent.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            Dialog dialog = (Dialog) param.thisObject;
-                            if (dialog.getWindow() != null) {
-                                currentWindow = dialog.getWindow();
-                            }
-                            MotionEvent event = (MotionEvent) param.args[0];
-                            if (event != null) {
-                                int action = event.getActionMasked();
-                                boolean forceReset = (action == MotionEvent.ACTION_DOWN
-                                        || action == MotionEvent.ACTION_UP);
-                                boostAndResetTimer(forceReset);
-                            }
-                        }
-                    }
-            );
-        } catch (Throwable ignored) {
-        }
-
-        // 7. 核心打字入口 C：Hook 每次按键上屏必调的 getCurrentInputConnection（跨 APK 边界，绝不内联）
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.inputmethodservice.InputMethodService",
-                    lpparam.classLoader,
-                    "getCurrentInputConnection",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            currentIms = param.thisObject;
-                            boostAndResetTimer(false);
-                        }
-                    }
-            );
-        } catch (Throwable ignored) {
+            XposedBridge.log(TAG + "Failed to init DisplayModeDirector refs: " + t.getMessage());
         }
     }
 
-    private void boostAndResetTimer(boolean forceUpdateTimer) {
-        long now = SystemClock.uptimeMillis();
-        // 如果当前已经处于 120Hz 锁定状态，且距离上次续期不足 250ms，则直接跳过以节省开销
-        if (isLocked120 && !forceUpdateTimer && (now - lastScheduleTime < INTERACTION_THROTTLE_MS)) {
-            return;
-        }
-        lastScheduleTime = now;
-
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            applyBoostOnMainThread();
-        } else {
-            getMainHandler().post(new Runnable() {
-                @Override
-                public void run() {
-                    applyBoostOnMainThread();
-                }
-            });
-        }
-    }
-
-    private void applyBoostOnMainThread() {
-        Handler handler = getMainHandler();
-        handler.removeCallbacks(idleReleaseTask);
-        setWindowMinRefreshRate(getActiveWindow(), BOOST_FPS);
-        isLocked120 = true;
-        handler.postDelayed(idleReleaseTask, IDLE_TIMEOUT_MS);
-    }
-
-    private void setWindowMinRefreshRate(Window window, float minRate) {
-        if (window == null) return;
+    private boolean isImeWindowVisible() {
         try {
-            WindowManager.LayoutParams params = window.getAttributes();
-            if (params == null) return;
+            Object dc = mDefaultDisplayContent;
+            if (dc == null || mImeWindowField == null) return false;
 
-            try {
-                float currentMin = XposedHelpers.getFloatField(params, "preferredMinDisplayRefreshRate");
-                float currentMax = XposedHelpers.getFloatField(params, "preferredMaxDisplayRefreshRate");
-                if (Math.abs(currentMin - minRate) < 0.1f && Math.abs(currentMax - BOOST_FPS) < 0.1f) {
-                    return;
-                }
-                XposedHelpers.setFloatField(params, "preferredMinDisplayRefreshRate", minRate);
-                XposedHelpers.setFloatField(params, "preferredMaxDisplayRefreshRate", BOOST_FPS);
-            } catch (Throwable t) {
-                if (Math.abs(params.preferredRefreshRate - minRate) < 0.1f) {
-                    return;
-                }
-                params.preferredRefreshRate = minRate;
+            Object imeWindow = mImeWindowField.get(dc);
+            if (imeWindow == null) return false;
+
+            if (mIsVisibleMethod == null) {
+                mIsVisibleMethod = XposedHelpers.findMethodExact(imeWindow.getClass(), "isVisible");
             }
-
-            window.setAttributes(params);
-        } catch (Throwable t) {
-            XposedBridge.log("RefreshFix: Failed to set refresh rate: " + t.getMessage());
+            return (Boolean) mIsVisibleMethod.invoke(imeWindow);
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
-    private void disableToolkitTypingFrameRateLimit(ClassLoader classLoader) {
-        try {
-            XposedHelpers.setStaticBooleanField(View.class, "sToolkitFrameRateTypingReadOnlyFlagValue", false);
-        } catch (Throwable ignored) {
+    private void onImeInteraction() {
+        Handler handler = getWorkHandler();
+        if (handler == null) return;
+
+        handler.removeCallbacks(mReleaseBoostTask);
+        if (!mIsImeBoostActive) {
+            mIsImeBoostActive = true;
+            triggerSpecsUpdate();
+            if (!mFirstBoostLogged) {
+                mFirstBoostLogged = true;
+                XposedBridge.log(TAG + "IME 120Hz boost activated (first trigger verified).");
+            }
         }
+        handler.postDelayed(mReleaseBoostTask, IDLE_TIMEOUT_MS);
+    }
+
+    private void triggerSpecsUpdate() {
         try {
-            Class<?> vriClass = XposedHelpers.findClass("android.view.ViewRootImpl", classLoader);
-            XposedHelpers.setStaticBooleanField(vriClass, "sToolkitFrameRateTypingReadOnlyFlagValue", false);
+            if (mDisplayModeDirector != null && mNotifySpecsChangedMethod != null) {
+                mNotifySpecsChangedMethod.invoke(mDisplayModeDirector);
+            }
         } catch (Throwable ignored) {
         }
     }
 
-    private void hookFrameRateVotes(ClassLoader classLoader) {
-        try {
-            XposedBridge.hookAllMethods(
-                    SurfaceControl.Transaction.class,
-                    "setFrameRateCategory",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            if (param.args.length >= 2 && param.args[1] instanceof Integer) {
-                                int category = (Integer) param.args[1];
-                                if (category >= CATEGORY_LOW && category < CATEGORY_HIGH) {
-                                    param.args[1] = CATEGORY_HIGH;
-                                }
-                            }
+    private void applyBoostToSpecs(Object specs) throws Exception {
+        if (!mSpecsFieldsResolved) {
+            Class<?> specsClass = specs.getClass();
+            mPrimaryRangesField = findFieldSafe(specsClass, "primary", "primaryRanges");
+            mAppRequestRangesField = findFieldSafe(specsClass, "appRequest", "appRequestRanges");
+            mIdleConfigField = findFieldSafe(specsClass, "idleScreenRefreshRateConfig");
+
+            if (mPrimaryRangesField != null) {
+                Object primaryObj = mPrimaryRangesField.get(specs);
+                if (primaryObj != null) {
+                    Class<?> rangesClass = primaryObj.getClass();
+                    mPhysicalRangeField = findFieldSafe(rangesClass, "physical");
+                    mRenderRangeField = findFieldSafe(rangesClass, "render");
+                    if (mPhysicalRangeField != null) {
+                        Object rangeObj = mPhysicalRangeField.get(primaryObj);
+                        if (rangeObj != null) {
+                            mMinRateField = findFieldSafe(rangeObj.getClass(), "min");
+                            mMaxRateField = findFieldSafe(rangeObj.getClass(), "max");
                         }
                     }
-            );
-        } catch (Throwable ignored) {
+                }
+            }
+            mSpecsFieldsResolved = true;
         }
 
-        try {
-            XposedBridge.hookAllMethods(
-                    SurfaceControl.Transaction.class,
-                    "setFrameRate",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            if (param.args.length >= 2 && param.args[1] instanceof Float) {
-                                float rate = (Float) param.args[1];
-                                if (rate > 0.0f && rate < BOOST_FPS) {
-                                    param.args[1] = BOOST_FPS;
-                                }
-                            }
-                        }
-                    }
-            );
-        } catch (Throwable ignored) {
+        if (mPrimaryRangesField != null) {
+            lockRefreshRateRanges(mPrimaryRangesField.get(specs));
         }
+        if (mAppRequestRangesField != null) {
+            lockRefreshRateRanges(mAppRequestRangesField.get(specs));
+        }
+        // Android 15/16+: 打字活跃期内临时置空空闲降频配置，防止按键间隙掉回 24Hz
+        if (mIdleConfigField != null) {
+            mIdleConfigField.set(specs, null);
+        }
+    }
 
-        try {
-            XposedBridge.hookAllMethods(
-                    Surface.class,
-                    "setFrameRate",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            if (param.args.length >= 1 && param.args[0] instanceof Float) {
-                                float rate = (Float) param.args[0];
-                                if (rate > 0.0f && rate < BOOST_FPS) {
-                                    param.args[0] = BOOST_FPS;
-                                }
-                            }
-                        }
-                    }
-            );
-        } catch (Throwable ignored) {
+    private void lockRefreshRateRanges(Object rangesObj) throws Exception {
+        if (rangesObj == null || mPhysicalRangeField == null || mRenderRangeField == null) return;
+        lockSingleRange(mPhysicalRangeField.get(rangesObj));
+        lockSingleRange(mRenderRangeField.get(rangesObj));
+    }
+
+    private void lockSingleRange(Object rangeObj) throws Exception {
+        if (rangeObj == null || mMinRateField == null || mMaxRateField == null) return;
+        mMinRateField.setFloat(rangeObj, TARGET_FPS);
+        mMaxRateField.setFloat(rangeObj, TARGET_FPS);
+    }
+
+    private Field findFieldSafe(Class<?> clazz, String... names) {
+        for (String name : names) {
+            Field f = XposedHelpers.findFieldIfExists(clazz, name);
+            if (f != null) {
+                f.setAccessible(true);
+                return f;
+            }
         }
+        return null;
+    }
+
+    private Handler getWorkHandler() {
+        if (mDirectorHandler != null) {
+            return mDirectorHandler;
+        }
+        Looper mainLooper = Looper.getMainLooper();
+        return mainLooper != null ? new Handler(mainLooper) : null;
     }
 }
