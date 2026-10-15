@@ -32,6 +32,10 @@ public class MainHook implements IXposedHookLoadPackage {
     private volatile Handler mDirectorHandler;
     private Method mNotifySpecsChangedMethod;
 
+    // DisplayContent 与输入法窗口缓存
+    private volatile Object mCachedDisplayContent;
+    private Field mImeWindowField;
+
     // DesiredDisplayModeSpecs 反射字段缓存
     private final List<Field> mRangesFields = new ArrayList<>();
     private Field mIdleConfigField;
@@ -74,7 +78,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 1. 监听全局触摸事件：直接通过 mCallbacks -> mDisplayContent 检查输入法窗口是否可见
+     * 1. 监听全局触摸事件：检查输入法窗口是否可见
      */
     private void hookPointerListener(ClassLoader classLoader) {
         XposedHelpers.findAndHookMethod(
@@ -162,7 +166,6 @@ public class MainHook implements IXposedHookLoadPackage {
             mDirectorLock = XposedHelpers.getObjectField(director, "mLock");
             mDirectorHandler = (Handler) XposedHelpers.getObjectField(director, "mHandler");
 
-            // 修正方法名：AOSP 中带 Locked 后缀
             mNotifySpecsChangedMethod = XposedHelpers.findMethodExactIfExists(
                     director.getClass(), "notifyDesiredDisplayModeSpecsChangedLocked");
             if (mNotifySpecsChangedMethod == null) {
@@ -182,17 +185,19 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private boolean isImeWindowVisible(Object pointerListener) {
         try {
-            // SystemGesturesPointerEventListener.mCallbacks 即为 DisplayPolicy 实例
-            Object displayPolicy = XposedHelpers.getObjectField(pointerListener, "mCallbacks");
-            if (displayPolicy == null) return false;
+            Object displayContent = mCachedDisplayContent;
+            if (displayContent == null) {
+                displayContent = resolveDisplayContent(pointerListener);
+                if (displayContent == null) return false;
+            }
 
-            Object displayContent = XposedHelpers.getObjectField(displayPolicy, "mDisplayContent");
-            if (displayContent == null) return false;
+            if (mImeWindowField == null) {
+                mImeWindowField = XposedHelpers.findField(displayContent.getClass(), "mInputMethodWindow");
+            }
 
-            Object imeWindow = XposedHelpers.getObjectField(displayContent, "mInputMethodWindow");
+            Object imeWindow = mImeWindowField.get(displayContent);
             if (imeWindow == null) return false;
 
-            // 使用 callMethod 自动向上遍历父类 WindowContainer/WindowState 的 isVisible()
             return (Boolean) XposedHelpers.callMethod(imeWindow, "isVisible");
         } catch (Throwable t) {
             if (!mImeVisibilityErrorLogged) {
@@ -201,6 +206,43 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             return false;
         }
+    }
+
+    /**
+     * 兼容内部类 DisplayPolicy$1：通过 this$0 获取外部类 DisplayPolicy，再读取 mDisplayContent
+     */
+    private Object resolveDisplayContent(Object pointerListener) throws Exception {
+        Object callbacks = XposedHelpers.getObjectField(pointerListener, "mCallbacks");
+        if (callbacks == null) return null;
+
+        Object displayPolicy = null;
+        Field directDcField = XposedHelpers.findFieldIfExists(callbacks.getClass(), "mDisplayContent");
+        if (directDcField != null) {
+            displayPolicy = callbacks;
+        } else {
+            // 匿名内部类 DisplayPolicy$1 通过合成字段 this$0 持有外部类 DisplayPolicy
+            Field outerField = XposedHelpers.findFieldIfExists(callbacks.getClass(), "this$0");
+            if (outerField != null) {
+                displayPolicy = outerField.get(callbacks);
+            } else {
+                for (Field f : callbacks.getClass().getDeclaredFields()) {
+                    if (f.getType().getName().endsWith("DisplayPolicy")) {
+                        f.setAccessible(true);
+                        displayPolicy = f.get(callbacks);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (displayPolicy == null) return null;
+
+        Object dc = XposedHelpers.getObjectField(displayPolicy, "mDisplayContent");
+        if (dc != null) {
+            mCachedDisplayContent = dc;
+            XposedBridge.log(TAG + "DisplayContent resolved successfully.");
+        }
+        return dc;
     }
 
     private void onImeInteraction() {
